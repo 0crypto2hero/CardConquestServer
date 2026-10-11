@@ -124,6 +124,16 @@ function processPurchase(userId, currentCoins, res, PACK_COST) {
   }
 }
 
+// ⚠️ Route de test uniquement : à supprimer avant la mise en ligne finale
+app.get('/api/dev/reset/:userId', async (req, res) => {
+  try {
+    await run(`INSERT OR IGNORE INTO users (id, coins) VALUES (?, 1000)`, [req.params.userId]);
+    await run(`UPDATE users SET coins = 1000 WHERE id = ?`, [req.params.userId]);
+    res.json({ success: true, coins: 1000 });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 // Lancement du serveur sur le port dynamique de Railway ou 3000 en local
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
