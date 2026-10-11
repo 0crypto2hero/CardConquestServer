@@ -8,14 +8,26 @@ app.use(cors());
 app.use(express.json());
 
 // Connexion à la base de données (chemin compatible Railway avec volume ou local)
-const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH 
-  ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'game.db') 
+const dbPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
+  ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'game.db')
   : './game.db';
 
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) console.error("Erreur BDD:", err.message);
   else console.log(`Connecté à la base de données SQLite sur : ${dbPath}`);
 });
+
+// Helpers pour utiliser sqlite3 avec async/await
+const run = (sql, params = []) =>
+  new Promise((resolve, reject) =>
+    db.run(sql, params, function (err) {
+      err ? reject(err) : resolve(this);
+    })
+  );
+const get = (sql, params = []) =>
+  new Promise((resolve, reject) =>
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)))
+  );
 
 // Initialisation des tables et du joueur par défaut
 db.serialize(() => {
@@ -47,82 +59,65 @@ db.serialize(() => {
   `);
 
   const stmt = db.prepare(`INSERT OR IGNORE INTO cards (card_id, name, power, global_population) VALUES (?, ?, ?, 0)`);
+  const powerList = [10, 15, 25, 40, 50, 65, 80, 100, 120, 150];
   for (let i = 0; i <= 9; i++) {
-    const powerList = [10, 15, 25, 40, 50, 65, 80, 100, 120, 150];
     stmt.run(i, `Carte #${i + 1}`, powerList[i]);
   }
   stmt.finalize();
 });
 
 // Route d'initialisation / récupération de profil
-app.get('/api/user/:userId', (req, res) => {
-  const { userId } = req.params;
-
-  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
-    if (!user) {
-      db.run(`INSERT INTO users (id, coins) VALUES (?, 1000)`, [userId], () => {
-        return res.json({ success: true, coins: 1000 });
-      });
-    } else {
-      return res.json({ success: true, coins: user.coins });
-    }
-  });
+app.get('/api/user/:userId', async (req, res) => {
+  try {
+    await run(`INSERT OR IGNORE INTO users (id, coins) VALUES (?, 1000)`, [req.params.userId]);
+    const user = await get(`SELECT coins FROM users WHERE id = ?`, [req.params.userId]);
+    res.json({ success: true, coins: user.coins });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "Erreur serveur" });
+  }
 });
 
 // Route principale : Achat d'un Booster (5 Cartes) en GET
-app.get('/api/packs/buy', (req, res) => {
+app.get('/api/packs/buy', async (req, res) => {
   const userId = req.query.userId || 'player_123';
   const PACK_COST = 100;
 
-  db.get(`SELECT coins FROM users WHERE id = ?`, [userId], (err, user) => {
-    if (!user) {
-      db.run(`INSERT INTO users (id, coins) VALUES (?, 1000)`, [userId], () => {
-        processPurchase(userId, 1000, res, PACK_COST);
-      });
-    } else {
-      processPurchase(userId, user.coins, res, PACK_COST);
+  try {
+    // Crée le joueur s'il n'existe pas
+    await run(`INSERT OR IGNORE INTO users (id, coins) VALUES (?, 1000)`, [userId]);
+
+    // Débit atomique : ne passe que s'il reste assez de pièces
+    const debit = await run(
+      `UPDATE users SET coins = coins - ? WHERE id = ? AND coins >= ?`,
+      [PACK_COST, userId, PACK_COST]
+    );
+    if (debit.changes === 0) {
+      return res.status(400).json({ success: false, error: "Pièces insuffisantes !" });
     }
-  });
-});
 
-// Fonction utilitaire pour gérer la transaction d'achat
-function processPurchase(userId, currentCoins, res, PACK_COST) {
-  if (currentCoins < PACK_COST) {
-    return res.status(400).json({ success: false, error: "Pièces insuffisantes !" });
-  }
-
-  const newCoins = currentCoins - PACK_COST;
-  db.run(`UPDATE users SET coins = ? WHERE id = ?`, [newCoins, userId]);
-
-  const drawnCards = [];
-  let completed = 0;
-
-  for (let i = 0; i < 5; i++) {
-    const randomCardId = Math.floor(Math.random() * 10);
-
-    db.run(`UPDATE cards SET global_population = global_population + 1 WHERE card_id = ?`, [randomCardId], function(err) {
-      db.run(`INSERT INTO inventory (user_id, card_id) VALUES (?, ?)`, [userId, randomCardId]);
-
-      db.get(`SELECT * FROM cards WHERE card_id = ?`, [randomCardId], (err, cardData) => {
-        drawnCards.push({
-          animationIndex: cardData.card_id,
-          name: cardData.name,
-          power: cardData.power,
-          globalPopulation: cardData.global_population
-        });
-
-        completed++;
-        if (completed === 5) {
-          return res.json({
-            success: true,
-            remainingCoins: newCoins,
-            drawnCards: drawnCards
-          });
-        }
+    // Tirage séquentiel des 5 cartes
+    const drawnCards = [];
+    for (let i = 0; i < 5; i++) {
+      const cardId = Math.floor(Math.random() * 10);
+      await run(`UPDATE cards SET global_population = global_population + 1 WHERE card_id = ?`, [cardId]);
+      await run(`INSERT INTO inventory (user_id, card_id) VALUES (?, ?)`, [userId, cardId]);
+      const card = await get(`SELECT * FROM cards WHERE card_id = ?`, [cardId]);
+      drawnCards.push({
+        animationIndex: card.card_id,
+        name: card.name,
+        power: card.power,
+        globalPopulation: card.global_population
       });
-    });
+    }
+
+    const user = await get(`SELECT coins FROM users WHERE id = ?`, [userId]);
+    res.json({ success: true, remainingCoins: user.coins, drawnCards });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "Erreur serveur" });
   }
-}
+});
 
 // ⚠️ Route de test uniquement : à supprimer avant la mise en ligne finale
 app.get('/api/dev/reset/:userId', async (req, res) => {
@@ -134,6 +129,7 @@ app.get('/api/dev/reset/:userId', async (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
 // Lancement du serveur sur le port dynamique de Railway ou 3000 en local
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
