@@ -103,7 +103,7 @@ db.serialize(() => {
 // ---------------------------------------------------------------------------
 const NICK_RE = /^[A-Za-z0-9_-]{3,16}$/;
 const SESSION_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
-const BAD_LOGIN = "Pseudo ou mot de passe incorrect";
+const BAD_LOGIN = "Incorrect nickname or password";
 // Hash factice : on compare toujours un mot de passe, même si le pseudo n'existe pas
 const DUMMY_HASH = bcrypt.hashSync('mot-de-passe-factice', 10);
 
@@ -125,7 +125,7 @@ function rateLimit(max, windowMs) {
     const now = Date.now();
     const recent = (hits.get(req.ip) || []).filter((t) => now - t < windowMs);
     if (recent.length >= max) {
-      return res.status(429).json({ success: false, error: "Trop de tentatives, réessayez plus tard" });
+      return res.status(429).json({ success: false, error: "Too many attempts, try again later" });
     }
     recent.push(now);
     hits.set(req.ip, recent);
@@ -140,20 +140,20 @@ async function auth(req, res, next) {
     const header = req.headers.authorization || '';
     const token = header.startsWith('Bearer ') ? header.slice(7) : req.body.token;
     if (!token || typeof token !== 'string') {
-      return res.status(401).json({ success: false, error: "Non connecté" });
+      return res.status(401).json({ success: false, error: "Not logged in" });
     }
     const session = await get(
       `SELECT user_id, created_at FROM sessions WHERE token_hash = ?`,
       [hashToken(token)]
     );
     if (!session || Date.now() - session.created_at > SESSION_MS) {
-      return res.status(401).json({ success: false, error: "Session expirée, reconnectez-vous" });
+      return res.status(401).json({ success: false, error: "Session expired, please log in again" });
     }
     req.userId = session.user_id;
     next();
   } catch (e) {
     console.error(e);
-    res.status(500).json({ success: false, error: "Erreur serveur" });
+    res.status(500).json({ success: false, error: "Server error" });
   }
 }
 
@@ -166,11 +166,11 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     if (!NICK_RE.test(nickname)) {
       return res.status(400).json({
         success: false,
-        error: "Pseudo invalide (3 à 16 caractères : lettres, chiffres, _ ou -)"
+        error: "Invalid nickname (3 to 16 characters: letters, digits, _ or -)"
       });
     }
     if (password.length < 6 || password.length > 64) {
-      return res.status(400).json({ success: false, error: "Mot de passe : 6 à 64 caractères" });
+      return res.status(400).json({ success: false, error: "Password must be 6 to 64 characters" });
     }
 
     const id = nickname.toLowerCase(); // "Bob" et "bob" sont le même pseudo
@@ -183,7 +183,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       );
     } catch (e) {
       if (e.code === 'SQLITE_CONSTRAINT') {
-        return res.status(409).json({ success: false, error: "Ce pseudo est déjà pris" });
+        return res.status(409).json({ success: false, error: "This nickname is already taken" });
       }
       throw e;
     }
@@ -192,7 +192,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     res.json({ success: true, token, nickname, coins: 1000 });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ success: false, error: "Erreur serveur" });
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
@@ -212,7 +212,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     res.json({ success: true, token, nickname: user.nickname, coins: user.coins });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ success: false, error: "Erreur serveur" });
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
@@ -223,7 +223,7 @@ app.post('/api/me', auth, async (req, res) => {
     res.json({ success: true, nickname: user.nickname, coins: user.coins });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ success: false, error: "Erreur serveur" });
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
@@ -242,7 +242,7 @@ app.post('/api/packs/buy', auth, async (req, res) => {
       [PACK_COST, userId, PACK_COST]
     );
     if (debit.changes === 0) {
-      return res.status(400).json({ success: false, error: "Pièces insuffisantes !" });
+      return res.status(400).json({ success: false, error: "Not enough coins!" });
     }
     debited = true;
 
@@ -270,7 +270,7 @@ app.post('/api/packs/buy', auth, async (req, res) => {
       try { await run(`UPDATE users SET coins = coins + ? WHERE id = ?`, [PACK_COST, userId]); }
       catch (e2) { console.error(e2); }
     }
-    res.status(500).json({ success: false, error: "Erreur serveur" });
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
@@ -287,7 +287,7 @@ if (process.env.ENABLE_DEV_ROUTES === '1') {
         [String(req.params.nickname).toLowerCase()]
       );
       if (result.changes === 0) {
-        return res.status(404).json({ success: false, error: "Joueur introuvable" });
+        return res.status(404).json({ success: false, error: "Player not found" });
       }
       res.json({ success: true, coins: 1000 });
     } catch (e) {
@@ -298,7 +298,7 @@ if (process.env.ENABLE_DEV_ROUTES === '1') {
 
 // Requête mal formée (JSON invalide, etc.)
 app.use((err, req, res, next) => {
-  res.status(400).json({ success: false, error: "Requête invalide" });
+  res.status(400).json({ success: false, error: "Invalid request" });
 });
 
 // Lancement du serveur sur le port dynamique de Railway ou 3000 en local
