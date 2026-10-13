@@ -275,6 +275,31 @@ app.post('/api/packs/buy', auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Inventaire : une ligne par carte possédée, avec le nombre d'exemplaires
+// ---------------------------------------------------------------------------
+app.post('/api/inventory', auth, async (req, res) => {
+  try {
+    const rows = await new Promise((resolve, reject) =>
+      db.all(
+        `SELECT c.card_id AS animationIndex, c.name, c.power,
+                c.global_population AS globalPopulation, COUNT(*) AS count
+         FROM inventory i
+         JOIN cards c ON c.card_id = i.card_id
+         WHERE i.user_id = ?
+         GROUP BY c.card_id
+         ORDER BY c.card_id`,
+        [req.userId],
+        (err, r) => (err ? reject(err) : resolve(r))
+      )
+    );
+    res.json({ success: true, total: rows.reduce((s, r) => s + r.count, 0), cards: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Route de test : désactivée par défaut.
 // Pour l'activer, ajoutez la variable ENABLE_DEV_ROUTES=1 dans Railway (onglet Variables).
 // ---------------------------------------------------------------------------
