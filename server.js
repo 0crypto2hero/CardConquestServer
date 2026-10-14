@@ -275,17 +275,17 @@ app.post('/api/packs/buy', auth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Inventaire : une ligne par carte possédée, avec le nombre d'exemplaires
+// Inventaire : les 10 cartes du jeu, dans l'ordre des animations (0 à 9),
+// avec le nombre d'exemplaires possédés (count = 0 si la carte n'est pas possédée)
 // ---------------------------------------------------------------------------
 app.post('/api/inventory', auth, async (req, res) => {
   try {
     const rows = await new Promise((resolve, reject) =>
       db.all(
         `SELECT c.card_id AS animationIndex, c.name, c.power,
-                c.global_population AS globalPopulation, COUNT(*) AS count
-         FROM inventory i
-         JOIN cards c ON c.card_id = i.card_id
-         WHERE i.user_id = ?
+                c.global_population AS globalPopulation, COUNT(i.id) AS count
+         FROM cards c
+         LEFT JOIN inventory i ON i.card_id = c.card_id AND i.user_id = ?
          GROUP BY c.card_id
          ORDER BY c.card_id`,
         [req.userId],
