@@ -118,7 +118,19 @@ db.serialize(() => {
       user_id TEXT,
       camp TEXT,
       outcome TEXT,
-      cards INTEGER
+      cards INTEGER,
+      coins INTEGER DEFAULT 0
+    )
+  `);
+  // Anciennes bases : ajout de la colonne des pièces gagnées (l'erreur "existe déjà" est ignorée)
+  db.run(`ALTER TABLE battle_log ADD COLUMN coins INTEGER DEFAULT 0`, () => {});
+
+  // Duels contre l'ordinateur : une ligne par victoire récompensée (pour limiter les gains par jour)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS vs_wins (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      day TEXT NOT NULL
     )
   `);
 
@@ -349,6 +361,8 @@ app.post('/api/inventory', auth, async (req, res) => {
 // ---------------------------------------------------------------------------
 const CAMPS = ['A', 'B'];
 const MAX_PLACED_PER_DAY = 42;
+const BATTLE_WIN_COINS = 1000; // camp gagnant, pour qui a posé ses 42 cartes
+const BATTLE_TIE_COINS = 4200; // égalité parfaite (easter egg), pour qui a posé ses 42 cartes
 
 // Jour de combat = date à Paris, au format AAAA-MM-JJ
 function parisDay(d = new Date()) {
@@ -405,9 +419,19 @@ async function resolveDay(day) {
   for (const key of Object.keys(perUser)) {
     const [userId, camp] = key.split('|');
     const outcome = rec.winner === 'TIE' ? 'tie' : camp === rec.winner ? 'won' : 'lost';
+    // Récompense en pièces, uniquement pour les joueurs qui ont posé leurs 42 cartes :
+    //  - camp gagnant : 1000 pièces
+    //  - égalité parfaite (easter egg) : 4200 pièces
+    const full = perUser[key] >= MAX_PLACED_PER_DAY;
+    let coins = 0;
+    if (full && outcome === 'won') coins = BATTLE_WIN_COINS;
+    else if (full && outcome === 'tie') coins = BATTLE_TIE_COINS;
+    if (coins > 0) {
+      await run(`UPDATE users SET coins = coins + ? WHERE id = ?`, [coins, userId]);
+    }
     await run(
-      `INSERT INTO battle_log (day, user_id, camp, outcome, cards) VALUES (?, ?, ?, ?, ?)`,
-      [day, userId, camp, outcome, perUser[key]]
+      `INSERT INTO battle_log (day, user_id, camp, outcome, cards, coins) VALUES (?, ?, ?, ?, ?, ?)`,
+      [day, userId, camp, outcome, perUser[key], coins]
     );
   }
 }
@@ -507,7 +531,7 @@ app.post('/api/battle/status', auth, async (req, res) => {
       [userId, day]
     );
     const last = await get(
-      `SELECT day, camp, outcome, cards FROM battle_log WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
+      `SELECT day, camp, outcome, cards, coins FROM battle_log WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
       [userId]
     );
 
@@ -515,12 +539,86 @@ app.post('/api/battle/status', auth, async (req, res) => {
       success: true,
       day,
       maxPerDay: MAX_PLACED_PER_DAY,
+      winCoins: BATTLE_WIN_COINS,
       myCamp: mine.length ? mine[0].camp : "",
       placedToday: mine.length ? mine[0].n : 0,
       totalA: total.A,
       totalB: total.B,
       secondsToResolution: secondsToParisMidnight(),
-      lastResult: last || { day: "", camp: "", outcome: "", cards: 0 }
+      lastResult: last || { day: "", camp: "", outcome: "", cards: 0, coins: 0 }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Duel rapide : 3 cartes contre 3 cartes tirées au hasard par le serveur.
+// Rien n'est détruit ni perdu. Une victoire rapporte des pièces (limitées par jour).
+// Le camp gagnant est celui dont la somme de puissance est la plus haute ; égalité = pas de gain.
+// ---------------------------------------------------------------------------
+const VS_CARDS = 3;
+const VS_WIN_COINS = 50;
+const VS_MAX_REWARDED_PER_DAY = 10;
+
+app.post('/api/vs/play', auth, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const picked = Array.isArray(req.body.cards) ? req.body.cards.map((n) => parseInt(n, 10)) : [];
+    if (picked.length !== VS_CARDS || picked.some((n) => !Number.isInteger(n) || n < 0 || n > 9)) {
+      return res.status(400).json({ success: false, error: `Pick exactly ${VS_CARDS} cards` });
+    }
+
+    // Le joueur doit posséder chaque carte choisie (autant d'exemplaires que de fois choisie)
+    const need = {};
+    picked.forEach((id) => { need[id] = (need[id] || 0) + 1; });
+    for (const id of Object.keys(need)) {
+      const owned = await get(
+        `SELECT COUNT(*) AS n FROM inventory WHERE user_id = ? AND card_id = ?`,
+        [userId, parseInt(id, 10)]
+      );
+      if (owned.n < need[id]) {
+        return res.status(400).json({ success: false, error: "You don't own these cards" });
+      }
+    }
+
+    const cards = await all(`SELECT card_id, power FROM cards ORDER BY card_id`);
+    const powerOf = (id) => cards.find((c) => c.card_id === id).power;
+    const yourCards = picked.map((id) => ({ animationIndex: id, power: powerOf(id) }));
+    const opponentCards = [];
+    for (let i = 0; i < VS_CARDS; i++) {
+      const id = Math.floor(Math.random() * 10);
+      opponentCards.push({ animationIndex: id, power: powerOf(id) });
+    }
+    const yourTotal = yourCards.reduce((s, c) => s + c.power, 0);
+    const opponentTotal = opponentCards.reduce((s, c) => s + c.power, 0);
+    const result = yourTotal > opponentTotal ? 'win' : yourTotal < opponentTotal ? 'lose' : 'tie';
+
+    const day = parisDay();
+    let reward = 0;
+    if (result === 'win') {
+      const today = await get(`SELECT COUNT(*) AS n FROM vs_wins WHERE user_id = ? AND day = ?`, [userId, day]);
+      if (today.n < VS_MAX_REWARDED_PER_DAY) {
+        await run(`INSERT INTO vs_wins (user_id, day) VALUES (?, ?)`, [userId, day]);
+        await run(`UPDATE users SET coins = coins + ? WHERE id = ?`, [VS_WIN_COINS, userId]);
+        reward = VS_WIN_COINS;
+      }
+    }
+    const rewardedToday = (await get(`SELECT COUNT(*) AS n FROM vs_wins WHERE user_id = ? AND day = ?`, [userId, day])).n;
+    const user = await get(`SELECT coins FROM users WHERE id = ?`, [userId]);
+
+    res.json({
+      success: true,
+      result,
+      yourCards,
+      opponentCards,
+      yourTotal,
+      opponentTotal,
+      reward,
+      rewardedToday,
+      maxRewardedPerDay: VS_MAX_REWARDED_PER_DAY,
+      remainingCoins: user.coins
     });
   } catch (e) {
     console.error(e);
