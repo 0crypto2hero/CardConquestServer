@@ -42,6 +42,10 @@ const get = (sql, params = []) =>
   new Promise((resolve, reject) =>
     db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)))
   );
+const all = (sql, params = []) =>
+  new Promise((resolve, reject) =>
+    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)))
+  );
 
 // ---------------------------------------------------------------------------
 // Base de données
@@ -80,6 +84,41 @@ db.serialize(() => {
       user_id TEXT,
       card_id INTEGER,
       obtained_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Combat : cartes posées (une ligne par exemplaire posé, verrouillé jusqu'à la résolution)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS placements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      inventory_id INTEGER NOT NULL UNIQUE,
+      card_id INTEGER NOT NULL,
+      camp TEXT NOT NULL,
+      day TEXT NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_placements_day ON placements(day)`);
+
+  // Résultat de chaque journée de combat (jour = date à Paris, AAAA-MM-JJ)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS battle_days (
+      day TEXT PRIMARY KEY,
+      winner TEXT,
+      total_a INTEGER DEFAULT 0,
+      total_b INTEGER DEFAULT 0
+    )
+  `);
+
+  // Ce qui est arrivé à chaque joueur (affiché à sa prochaine connexion)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS battle_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      day TEXT,
+      user_id TEXT,
+      camp TEXT,
+      outcome TEXT,
+      cards INTEGER
     )
   `);
 
@@ -283,9 +322,11 @@ app.post('/api/inventory', auth, async (req, res) => {
     const rows = await new Promise((resolve, reject) =>
       db.all(
         `SELECT c.card_id AS animationIndex, c.name, c.power,
-                c.global_population AS globalPopulation, COUNT(i.id) AS count
+                c.global_population AS globalPopulation,
+                COUNT(i.id) AS count, COUNT(p.id) AS placed
          FROM cards c
          LEFT JOIN inventory i ON i.card_id = c.card_id AND i.user_id = ?
+         LEFT JOIN placements p ON p.inventory_id = i.id
          GROUP BY c.card_id
          ORDER BY c.card_id`,
         [req.userId],
@@ -293,6 +334,194 @@ app.post('/api/inventory', auth, async (req, res) => {
       )
     );
     res.json({ success: true, total: rows.reduce((s, r) => s + r.count, 0), cards: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Combat : 2 camps (A et B), 42 cartes posées maximum par jour et par joueur.
+// Une carte posée est définitive : elle est verrouillée jusqu'à minuit (heure de Paris).
+// À minuit, le camp qui a le plus de puissance gagne et récupère ses cartes ;
+// le camp perdant voit ses cartes détruites (retirées de l'inventaire et de la population).
+// Égalité : personne ne perd rien.
+// ---------------------------------------------------------------------------
+const CAMPS = ['A', 'B'];
+const MAX_PLACED_PER_DAY = 42;
+
+// Jour de combat = date à Paris, au format AAAA-MM-JJ
+function parisDay(d = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(d);
+}
+
+function secondsToParisMidnight() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Paris', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  }).formatToParts(new Date());
+  const v = (t) => parseInt(parts.find((p) => p.type === t).value, 10);
+  return 86400 - ((v('hour') % 24) * 3600 + v('minute') * 60 + v('second'));
+}
+
+// Résout une journée passée. Peut être relancée sans risque : le gagnant est figé
+// dès le premier passage et chaque carte n'est détruite qu'une seule fois.
+async function resolveDay(day) {
+  let rec = await get(`SELECT * FROM battle_days WHERE day = ?`, [day]);
+  if (!rec) {
+    const sums = await all(
+      `SELECT p.camp AS camp, SUM(c.power) AS total
+       FROM placements p JOIN cards c ON c.card_id = p.card_id
+       WHERE p.day = ? GROUP BY p.camp`,
+      [day]
+    );
+    const total = { A: 0, B: 0 };
+    sums.forEach((s) => { total[s.camp] = s.total; });
+    const winner = total.A > total.B ? 'A' : total.B > total.A ? 'B' : 'TIE';
+    await run(
+      `INSERT OR IGNORE INTO battle_days (day, winner, total_a, total_b) VALUES (?, ?, ?, ?)`,
+      [day, winner, total.A, total.B]
+    );
+    rec = await get(`SELECT * FROM battle_days WHERE day = ?`, [day]);
+  }
+
+  const rows = await all(`SELECT id, user_id, inventory_id, card_id, camp FROM placements WHERE day = ?`, [day]);
+  const perUser = {};
+  for (const r of rows) {
+    const lost = rec.winner !== 'TIE' && r.camp !== rec.winner;
+    if (lost) {
+      const del = await run(`DELETE FROM inventory WHERE id = ?`, [r.inventory_id]);
+      if (del.changes === 1) {
+        await run(`UPDATE cards SET global_population = MAX(global_population - 1, 0) WHERE card_id = ?`, [r.card_id]);
+      }
+    }
+    const done = await run(`DELETE FROM placements WHERE id = ?`, [r.id]);
+    if (done.changes === 1) {
+      const key = r.user_id + '|' + r.camp;
+      perUser[key] = (perUser[key] || 0) + 1;
+    }
+  }
+  for (const key of Object.keys(perUser)) {
+    const [userId, camp] = key.split('|');
+    const outcome = rec.winner === 'TIE' ? 'tie' : camp === rec.winner ? 'won' : 'lost';
+    await run(
+      `INSERT INTO battle_log (day, user_id, camp, outcome, cards) VALUES (?, ?, ?, ?, ?)`,
+      [day, userId, camp, outcome, perUser[key]]
+    );
+  }
+}
+
+let resolving = false;
+async function resolvePastDays() {
+  if (resolving) return;
+  resolving = true;
+  try {
+    const days = await all(`SELECT DISTINCT day FROM placements WHERE day < ? ORDER BY day`, [parisDay()]);
+    for (const d of days) await resolveDay(d.day);
+  } catch (e) {
+    console.error('Résolution du combat :', e);
+  } finally {
+    resolving = false;
+  }
+}
+setInterval(resolvePastDays, 60 * 1000);
+setTimeout(resolvePastDays, 5000);
+
+// Poser des cartes dans un camp
+app.post('/api/battle/place', auth, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const camp = String(req.body.camp || '').toUpperCase();
+    const cardId = parseInt(req.body.cardId, 10);
+    const count = req.body.count === undefined ? 1 : parseInt(req.body.count, 10);
+
+    if (!CAMPS.includes(camp)) return res.status(400).json({ success: false, error: "Invalid camp" });
+    if (!Number.isInteger(cardId) || cardId < 0 || cardId > 9) return res.status(400).json({ success: false, error: "Invalid card" });
+    if (!Number.isInteger(count) || count < 1 || count > MAX_PLACED_PER_DAY) return res.status(400).json({ success: false, error: "Invalid amount" });
+
+    const day = parisDay();
+    const mine = await all(
+      `SELECT camp, COUNT(*) AS n FROM placements WHERE user_id = ? AND day = ? GROUP BY camp`,
+      [userId, day]
+    );
+    const inOther = mine.filter((r) => r.camp !== camp).reduce((s, r) => s + r.n, 0);
+    if (inOther > 0) {
+      return res.status(400).json({ success: false, error: "You already joined the other camp today" });
+    }
+    const placedToday = mine.filter((r) => r.camp === camp).reduce((s, r) => s + r.n, 0);
+    if (placedToday + count > MAX_PLACED_PER_DAY) {
+      return res.status(400).json({ success: false, error: `Daily limit reached (${MAX_PLACED_PER_DAY} cards)` });
+    }
+
+    const free = await all(
+      `SELECT i.id FROM inventory i
+       LEFT JOIN placements p ON p.inventory_id = i.id
+       WHERE i.user_id = ? AND i.card_id = ? AND p.id IS NULL
+       LIMIT ?`,
+      [userId, cardId, count]
+    );
+    if (free.length < count) {
+      return res.status(400).json({ success: false, error: "Not enough free copies of this card" });
+    }
+
+    for (const row of free) {
+      await run(
+        `INSERT INTO placements (user_id, inventory_id, card_id, camp, day) VALUES (?, ?, ?, ?, ?)`,
+        [userId, row.id, cardId, camp, day]
+      );
+    }
+    res.json({
+      success: true,
+      camp,
+      placedToday: placedToday + count,
+      remainingToday: MAX_PLACED_PER_DAY - placedToday - count
+    });
+  } catch (e) {
+    console.error(e);
+    if (e && e.code === 'SQLITE_CONSTRAINT') {
+      return res.status(409).json({ success: false, error: "Please try again" });
+    }
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// État du combat : mon camp du jour, totaux des 2 camps, temps restant, dernier résultat
+app.post('/api/battle/status', auth, async (req, res) => {
+  try {
+    await resolvePastDays();
+    const userId = req.userId;
+    const day = parisDay();
+
+    const sums = await all(
+      `SELECT p.camp AS camp, SUM(c.power) AS total
+       FROM placements p JOIN cards c ON c.card_id = p.card_id
+       WHERE p.day = ? GROUP BY p.camp`,
+      [day]
+    );
+    const total = { A: 0, B: 0 };
+    sums.forEach((s) => { total[s.camp] = s.total; });
+
+    const mine = await all(
+      `SELECT camp, COUNT(*) AS n FROM placements WHERE user_id = ? AND day = ? GROUP BY camp`,
+      [userId, day]
+    );
+    const last = await get(
+      `SELECT day, camp, outcome, cards FROM battle_log WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      day,
+      maxPerDay: MAX_PLACED_PER_DAY,
+      myCamp: mine.length ? mine[0].camp : "",
+      placedToday: mine.length ? mine[0].n : 0,
+      totalA: total.A,
+      totalB: total.B,
+      secondsToResolution: secondsToParisMidnight(),
+      lastResult: last || { day: "", camp: "", outcome: "", cards: 0 }
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ success: false, error: "Server error" });
